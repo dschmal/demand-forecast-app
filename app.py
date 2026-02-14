@@ -146,18 +146,28 @@ def _infer_freq(idx: pd.DatetimeIndex) -> str:
     return pd.infer_freq(idx) or "D"
 
 def moving_average_forecast(y: pd.Series, horizon: int, window: int = 7) -> pd.Series:
-    last = float(y.rolling(window=window).mean().iloc[-1])
+    # Repeat the last "window" actual values into the future (pattern repetition)
+    last_vals = y.iloc[-window:].values
+    reps = int(np.ceil(horizon / window))
+    preds = np.tile(last_vals, reps)[:horizon]
+
     idx = pd.date_range(start=y.index[-1], periods=horizon + 1, freq=_infer_freq(y.index))[1:]
-    return pd.Series([last] * horizon, index=idx, name="Moving Average")
+    return pd.Series(preds, index=idx, name="Moving Average (pattern)")
 
 def exp_smoothing_forecast(y: pd.Series, horizon: int, alpha: float = 0.3) -> pd.Series:
     if not _HAS_STATSMODELS:
         raise RuntimeError("statsmodels is not available in this environment.")
-    model = SimpleExpSmoothing(y, initialization_method="estimated").fit(
-        smoothing_level=alpha, optimized=False
-    )
+
+    # Holt (trend) instead of SES (level-only)
+    model = ExponentialSmoothing(
+        y,
+        trend="add",
+        seasonal=None,
+        initialization_method="estimated",
+    ).fit(optimized=True)
+
     fc = model.forecast(horizon)
-    fc.name = "Exponential Smoothing"
+    fc.name = "Holt (trend)"
     return fc
 
 def holt_winters_forecast(y: pd.Series, horizon: int, seasonal_periods: int, trend: str | None, seasonal: str) -> pd.Series:
