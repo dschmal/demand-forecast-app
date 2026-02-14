@@ -1,6 +1,9 @@
 """
-Demand Forecast Visualizer
-Built for simple Streamlit deployment (single-file app; no local package imports).
+Demand Forecast Visualizer (Streamlit)
+Optimized for modeling + forecasting, single-file deployment.
+
+Bucket selection: Day / Week / Month (resampling based on imported data).
+Keeps Plotly visualization and adds stronger baselines + safer ETS/HW + improved XGBoost features.
 """
 
 import time
@@ -12,7 +15,7 @@ import plotly.graph_objects as go
 
 # Optional dependencies (app still runs if these fail to import)
 try:
-    from statsmodels.tsa.holtwinters import SimpleExpSmoothing, ExponentialSmoothing
+    from statsmodels.tsa.holtwinters import ExponentialSmoothing
     _HAS_STATSMODELS = True
 except Exception:
     _HAS_STATSMODELS = False
@@ -38,7 +41,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# ---------------- Dark theme CSS (similar style to your EOQ app) ----------------
+# ---------------- Dark theme CSS ----------------
 st.markdown("""
     <style>
     .main { background-color: #0E1117; }
@@ -141,92 +144,170 @@ def bias(y_true, y_pred):
     return float(np.mean(y_pred - y_true))
 
 
+# ---------------- Bucket utilities ----------------
+BUCKET_TO_RULE = {
+    "Day": "D",
+    "Week": "W-MON",  # weekly buckets starting Monday (nice for business data)
+    "Month": "MS",    # month start
+}
+
+def _suggest_bucket_from_dates(dt_index: pd.DatetimeIndex) -> str:
+    if len(dt_index) < 3:
+        return "Day"
+    diffs = dt_index.sort_values().to_series().diff().dropna()
+    if diffs.empty:
+        return "Day"
+    median_days = diffs.median() / pd.Timedelta(days=1)
+    if median_days <= 2:
+        return "Day"
+    if median_days <= 14:
+        return "Week"
+    return "Month"
+
+def _seasonal_period_for_bucket(bucket: str) -> int:
+    # sensible defaults for demand
+    if bucket == "Day":
+        return 7
+    if bucket == "Week":
+        return 52
+    return 12
+
+def _future_index(last_ts: pd.Timestamp, periods: int, rule: str) -> pd.DatetimeIndex:
+    # start AFTER the last observed bucket
+    rng = pd.date_range(start=last_ts, periods=periods + 1, freq=rule)
+    return rng[1:]
+
+
 # ---------------- Forecasting methods ----------------
-def _infer_freq(idx: pd.DatetimeIndex) -> str:
-    return pd.infer_freq(idx) or "D"
-
-def moving_average_forecast(y: pd.Series, horizon: int, window: int = 7) -> pd.Series:
-    # Repeat the last "window" actual values into the future (pattern repetition)
-    last_vals = y.iloc[-window:].values
-    reps = int(np.ceil(horizon / window))
-    preds = np.tile(last_vals, reps)[:horizon]
-
-    idx = pd.date_range(start=y.index[-1], periods=horizon + 1, freq=_infer_freq(y.index))[1:]
-    return pd.Series(preds, index=idx, name="Moving Average (pattern)")
-
-def exp_smoothing_forecast(y: pd.Series, horizon: int, alpha: float = 0.3) -> pd.Series:
-    if not _HAS_STATSMODELS:
-        raise RuntimeError("statsmodels is not available in this environment.")
-
-    # Holt (trend) instead of SES (level-only)
-    model = ExponentialSmoothing(
-        y,
-        trend="add",
-        seasonal=None,
-        initialization_method="estimated",
-    ).fit(optimized=True)
-
-    fc = model.forecast(horizon)
-    fc.name = "Holt (trend)"
+def naive_forecast(y: pd.Series, horizon: int, rule: str) -> pd.Series:
+    idx = _future_index(y.index[-1], horizon, rule)
+    fc = pd.Series([float(y.iloc[-1])] * horizon, index=idx, name="Naive")
     return fc
 
-def holt_winters_forecast(y: pd.Series, horizon: int, seasonal_periods: int, trend: str | None, seasonal: str) -> pd.Series:
+def seasonal_naive_forecast(y: pd.Series, horizon: int, rule: str, seasonal_periods: int) -> pd.Series:
+    idx = _future_index(y.index[-1], horizon, rule)
+    if seasonal_periods <= 1 or len(y) < seasonal_periods:
+        # fallback to naive
+        return naive_forecast(y, horizon, rule).rename("Seasonal Naive")
+    season = y.iloc[-seasonal_periods:].values
+    reps = int(np.ceil(horizon / seasonal_periods))
+    preds = np.tile(season, reps)[:horizon]
+    return pd.Series(preds, index=idx, name="Seasonal Naive")
+
+def moving_average_level_forecast(y: pd.Series, horizon: int, rule: str, window: int = 7) -> pd.Series:
+    window = max(1, int(window))
+    level = float(y.iloc[-window:].mean()) if len(y) >= window else float(y.mean())
+    idx = _future_index(y.index[-1], horizon, rule)
+    return pd.Series([level] * horizon, index=idx, name="Moving Average (level)")
+
+def ets_forecast(y: pd.Series, horizon: int, rule: str, seasonal_periods: int, seasonal_mode: str, trend_mode: str) -> pd.Series:
+    """
+    ETS via statsmodels ExponentialSmoothing.
+    Safety:
+      - Only enable seasonality if enough history exists.
+      - If multiplicative is chosen, require strictly positive series.
+    """
     if not _HAS_STATSMODELS:
         raise RuntimeError("statsmodels is not available in this environment.")
+
+    y_in = y.astype(float).copy()
+
+    use_seasonal = seasonal_periods >= 2 and len(y_in) >= (2 * seasonal_periods + 4)
+    seasonal = seasonal_mode if use_seasonal else None
+
+    if (seasonal == "mul" or trend_mode == "mul") and (y_in <= 0).any():
+        raise RuntimeError("Multiplicative ETS requires all demand values > 0.")
+
     model = ExponentialSmoothing(
-        y,
-        trend=trend,
+        y_in,
+        trend=trend_mode,
         seasonal=seasonal,
-        seasonal_periods=seasonal_periods,
+        seasonal_periods=seasonal_periods if use_seasonal else None,
         initialization_method="estimated",
     ).fit(optimized=True)
+
     fc = model.forecast(horizon)
-    fc.name = "Holt-Winters"
+    fc.index = _future_index(y.index[-1], horizon, rule)
+    fc.name = f"ETS ({trend_mode or 'None'}/{seasonal_mode if use_seasonal else 'None'})"
     return fc
 
-def prophet_forecast(y: pd.Series, horizon: int, seasonality_mode: str) -> pd.Series:
+def prophet_forecast(y: pd.Series, horizon: int, rule: str, seasonality_mode: str) -> pd.Series:
     if not _HAS_PROPHET:
         raise RuntimeError("prophet is not available in this environment.")
     df = pd.DataFrame({"ds": y.index, "y": y.values})
-    m = Prophet(
-        seasonality_mode=seasonality_mode,
-        yearly_seasonality=True,
-        weekly_seasonality=True,
-        daily_seasonality=False,
-    )
+    # Let Prophet infer seasonalities; add common ones:
+    m = Prophet(seasonality_mode=seasonality_mode)
+    if rule == "D":
+        m.add_seasonality(name="weekly", period=7, fourier_order=6)
+        m.add_seasonality(name="yearly", period=365.25, fourier_order=10)
+    elif rule.startswith("W"):
+        m.add_seasonality(name="yearly", period=52, fourier_order=10)
+    else:
+        m.add_seasonality(name="yearly", period=12, fourier_order=8)
+
     m.fit(df)
-    future = m.make_future_dataframe(periods=horizon, freq=_infer_freq(y.index))
-    fc = m.predict(future)[["ds", "yhat"]].set_index("ds")["yhat"].iloc[-horizon:]
-    fc.name = "Prophet"
-    return fc
+    future = m.make_future_dataframe(periods=horizon, freq=rule)
+    pred = m.predict(future)[["ds", "yhat"]].set_index("ds")["yhat"].iloc[-horizon:]
+    pred.index = _future_index(y.index[-1], horizon, rule)
+    pred.name = "Prophet"
+    return pred
 
-def _make_time_features(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-    out["month"] = out.index.month
-    out["quarter"] = out.index.quarter
-    out["day_of_week"] = out.index.dayofweek
-    out["week_of_year"] = out.index.isocalendar().week.astype(int)
+def _make_time_features(ts: pd.Series, bucket: str, seasonal_periods: int) -> pd.DataFrame:
+    """
+    Feature set designed to work for Day/Week/Month buckets.
+    Builds lag and rolling features plus calendar features.
+    """
+    df = pd.DataFrame({"y": ts.astype(float)})
+    idx = df.index
 
-    out["lag_1"] = out["y"].shift(1)
-    out["lag_7"] = out["y"].shift(7)
-    out["lag_14"] = out["y"].shift(14)
+    # Calendar features depend on bucket granularity
+    df["month"] = idx.month
+    df["quarter"] = idx.quarter
+    df["year"] = idx.year
 
-    out["roll_mean_4"] = out["y"].rolling(4).mean()
-    out["roll_std_4"] = out["y"].rolling(4).std()
-    return out
+    if bucket == "Day":
+        df["dow"] = idx.dayofweek
+        df["dom"] = idx.day
+        df["woy"] = idx.isocalendar().week.astype(int)
+    elif bucket == "Week":
+        df["woy"] = idx.isocalendar().week.astype(int)
+    else:
+        df["dom"] = idx.day  # mostly 1 for MS, but harmless
 
-def xgboost_forecast(y: pd.Series, horizon: int, n_estimators: int, max_depth: int, learning_rate: float) -> pd.Series:
+    # Lags
+    for L in [1, 2, 3, 4]:
+        df[f"lag_{L}"] = df["y"].shift(L)
+
+    # Seasonal lag
+    if seasonal_periods and seasonal_periods >= 2:
+        df[f"lag_season_{seasonal_periods}"] = df["y"].shift(seasonal_periods)
+
+    # Rolling stats
+    for w in [3, 6, 12]:
+        df[f"roll_mean_{w}"] = df["y"].rolling(w).mean()
+        df[f"roll_std_{w}"] = df["y"].rolling(w).std()
+
+    return df
+
+def xgboost_forecast(y: pd.Series, horizon: int, rule: str, bucket: str,
+                     seasonal_periods: int, n_estimators: int, max_depth: int,
+                     learning_rate: float) -> pd.Series:
     if not _HAS_XGB:
         raise RuntimeError("xgboost is not available in this environment.")
-    df = pd.DataFrame({"y": y})
-    feat = _make_time_features(df).dropna()
+
+    y_hist = y.astype(float).copy()
+
+    feat = _make_time_features(y_hist, bucket=bucket, seasonal_periods=seasonal_periods).dropna()
+    if len(feat) < 25:
+        raise RuntimeError("Not enough history after lag/rolling features for XGBoost (need ~25+ rows).")
+
     X = feat.drop(columns=["y"])
     y_train = feat["y"]
 
     model = xgb.XGBRegressor(
-        n_estimators=n_estimators,
-        max_depth=max_depth,
-        learning_rate=learning_rate,
+        n_estimators=int(n_estimators),
+        max_depth=int(max_depth),
+        learning_rate=float(learning_rate),
         objective="reg:squarederror",
         subsample=0.9,
         colsample_bytree=0.9,
@@ -234,48 +315,73 @@ def xgboost_forecast(y: pd.Series, horizon: int, n_estimators: int, max_depth: i
     )
     model.fit(X, y_train)
 
-    idx_future = pd.date_range(start=y.index[-1], periods=horizon + 1, freq=_infer_freq(y.index))[1:]
-    history = df.copy()
+    idx_future = _future_index(y_hist.index[-1], horizon, rule)
     preds = []
+
+    history = y_hist.copy()
     for ts in idx_future:
-        tmp = pd.DataFrame({"y": history["y"]})
-        tmp.index = history.index
-        x_last = _make_time_features(tmp).iloc[[-1]].drop(columns=["y"])
+        tmp_feat = _make_time_features(history, bucket=bucket, seasonal_periods=seasonal_periods).iloc[[-1]]
+        x_last = tmp_feat.drop(columns=["y"])
         yhat = float(model.predict(x_last)[0])
         preds.append(yhat)
-        history.loc[ts, "y"] = yhat
+        history.loc[ts] = yhat
 
     return pd.Series(preds, index=idx_future, name="XGBoost")
 
 
 # ---------------- Data utilities ----------------
 def load_sample():
+    # Expect you to ship a file in your repo at data/sample_weekly_retail.csv
     return pd.read_csv("data/sample_weekly_retail.csv")
 
-def validate_and_prepare(df: pd.DataFrame, date_col: str, y_col: str) -> pd.Series:
+def _coerce_datetime(s: pd.Series) -> pd.Series:
+    return pd.to_datetime(s, errors="coerce", utc=False)
+
+def validate_and_prepare(df: pd.DataFrame, date_col: str, y_col: str, bucket: str) -> pd.Series:
     out = df.copy()
-    out[date_col] = pd.to_datetime(out[date_col], errors="coerce")
-    out = out.dropna(subset=[date_col, y_col])
-    out = out.sort_values(date_col).set_index(date_col)
 
+    if date_col not in out.columns or y_col not in out.columns:
+        raise ValueError(f"Missing columns. Found: {list(out.columns)}")
+
+    out[date_col] = _coerce_datetime(out[date_col])
     out[y_col] = pd.to_numeric(out[y_col], errors="coerce")
-    out = out.dropna(subset=[y_col])
 
-    # if frequency can't be inferred, resample to daily sum (safe default)
-    if pd.infer_freq(out.index) is None:
-        out = out.resample("D").sum()
+    out = out.dropna(subset=[date_col, y_col]).sort_values(date_col)
+    out = out.set_index(date_col)
 
-    out = out.asfreq(_infer_freq(out.index))
-    out[y_col] = out[y_col].interpolate(limit_direction="both")
-    return out[y_col].rename("demand")
+    # Resample into selected bucket using sum (typical demand aggregation)
+    rule = BUCKET_TO_RULE[bucket]
+    y = out[y_col].resample(rule).sum()
+
+    # Fill gaps sensibly
+    # For demand, missing buckets often mean zero; but if your data is sparse sampling, interpolation helps.
+    # Here: use 0 fill then smooth interpolate for stability.
+    y = y.asfreq(rule)
+    y = y.fillna(0.0)
+    # Avoid introducing negatives, keep it simple:
+    y = y.astype(float)
+
+    # Optional light smoothing for extremely noisy data (comment out if undesired)
+    # y = y.rolling(2, min_periods=1).mean()
+
+    y.name = "demand"
+    return y
 
 
 @st.cache_data(show_spinner=False)
-def run_all(y: pd.Series, horizon: int, train_ratio: float, cfg: dict):
-    n = len(y)
-    split = max(2, int(n * train_ratio))
-    y_train = y.iloc[:split]
-    y_test = y.iloc[split : split + horizon]
+def run_models(y: pd.Series, horizon: int, cfg: dict):
+    """
+    Uses last `horizon` as test window; train is the rest.
+    Returns train/test, forecast dict, metrics df, errors dict.
+    """
+    if horizon < 1:
+        raise ValueError("Horizon must be >= 1")
+    if len(y) < max(8, horizon + 4):
+        raise ValueError("Time series too short for selected horizon.")
+
+    y = y.sort_index()
+    y_train = y.iloc[:-horizon].copy()
+    y_test = y.iloc[-horizon:].copy()
 
     forecasts = {}
     timings = {}
@@ -285,31 +391,49 @@ def run_all(y: pd.Series, horizon: int, train_ratio: float, cfg: dict):
         t0 = time.time()
         try:
             fc = fn()
+            # Align forecast index to test index if possible (same bucket)
             forecasts[name] = fc
         except Exception as e:
             errors[name] = str(e)
         timings[name] = time.time() - t0
 
+    rule = cfg["rule"]
+    bucket = cfg["bucket"]
+    sp = cfg["seasonal_periods"]
+
+    # Baselines
+    if cfg["use_naive"]:
+        _timeit("Naive", lambda: naive_forecast(y_train, horizon, rule))
+
+    if cfg["use_snaive"]:
+        _timeit("Seasonal Naive", lambda: seasonal_naive_forecast(y_train, horizon, rule, sp))
+
     if cfg["use_ma"]:
-        _timeit("Moving Average", lambda: moving_average_forecast(y_train, horizon, cfg["ma_window"]))
+        _timeit("Moving Average", lambda: moving_average_level_forecast(y_train, horizon, rule, cfg["ma_window"]))
 
-    if cfg["use_es"]:
-        _timeit("Exponential Smoothing", lambda: exp_smoothing_forecast(y_train, horizon, cfg["es_alpha"]))
-
-    if cfg["use_hw"]:
-        _timeit("Holt-Winters", lambda: holt_winters_forecast(
-            y_train, horizon,
-            seasonal_periods=cfg["hw_seasonal_periods"],
-            trend=cfg["hw_trend"],
-            seasonal=cfg["hw_seasonal"],
+    # ETS/HW family
+    if cfg["use_ets"]:
+        _timeit("ETS", lambda: ets_forecast(
+            y_train,
+            horizon=horizon,
+            rule=rule,
+            seasonal_periods=sp,
+            seasonal_mode=cfg["ets_seasonal"],
+            trend_mode=cfg["ets_trend"],
         ))
 
     if cfg["use_prophet"]:
-        _timeit("Prophet", lambda: prophet_forecast(y_train, horizon, cfg["prophet_mode"]))
+        _timeit("Prophet", lambda: prophet_forecast(
+            y_train, horizon=horizon, rule=rule, seasonality_mode=cfg["prophet_mode"]
+        ))
 
     if cfg["use_xgb"]:
         _timeit("XGBoost", lambda: xgboost_forecast(
-            y_train, horizon,
+            y_train,
+            horizon=horizon,
+            rule=rule,
+            bucket=bucket,
+            seasonal_periods=sp,
             n_estimators=cfg["xgb_estimators"],
             max_depth=cfg["xgb_depth"],
             learning_rate=cfg["xgb_lr"],
@@ -327,7 +451,7 @@ def run_all(y: pd.Series, horizon: int, train_ratio: float, cfg: dict):
                 "RMSE": rmse(yt, yp),
                 "MAE": mae(yt, yp),
                 "Bias": bias(yt, yp),
-                "Train Time (s)": timings.get(name, np.nan),
+                "Train Time (s)": float(timings.get(name, np.nan)),
             })
         else:
             rows.append({
@@ -336,7 +460,7 @@ def run_all(y: pd.Series, horizon: int, train_ratio: float, cfg: dict):
                 "RMSE": np.nan,
                 "MAE": np.nan,
                 "Bias": np.nan,
-                "Train Time (s)": timings.get(name, np.nan),
+                "Train Time (s)": float(timings.get(name, np.nan)),
             })
 
     metrics_df = pd.DataFrame(rows).sort_values("MAPE (%)", na_position="last").reset_index(drop=True)
@@ -371,9 +495,10 @@ st.markdown("<p class='subtitle'>Compare forecasting methods on your demand hist
 
 st.markdown("""
 <div style='margin-bottom: 1.6rem;'>
+    <span class='metric-pill'>Naive</span>
+    <span class='metric-pill'>Seasonal Naive</span>
     <span class='metric-pill'>Moving Average</span>
-    <span class='metric-pill'>Exponential Smoothing</span>
-    <span class='metric-pill'>Holt-Winters</span>
+    <span class='metric-pill'>ETS (Holt-Winters)</span>
     <span class='metric-pill'>Prophet</span>
     <span class='metric-pill'>XGBoost</span>
 </div>
@@ -394,21 +519,35 @@ st.sidebar.markdown("### 🧾 Columns")
 date_col = st.sidebar.text_input("Date column", value="date")
 y_col = st.sidebar.text_input("Demand column", value="demand")
 
+# Bucket selection (default suggested from data after load)
+bucket_default = "Day"
+if df_raw is not None and date_col in df_raw.columns:
+    try:
+        dt_tmp = pd.to_datetime(df_raw[date_col], errors="coerce").dropna()
+        if len(dt_tmp) >= 3:
+            bucket_default = _suggest_bucket_from_dates(pd.DatetimeIndex(dt_tmp))
+    except Exception:
+        bucket_default = "Day"
+
+st.sidebar.markdown("### 🪣 Forecast bucket")
+bucket = st.sidebar.selectbox("Aggregate & forecast by", ["Day", "Week", "Month"], index=["Day","Week","Month"].index(bucket_default))
+rule = BUCKET_TO_RULE[bucket]
+seasonal_periods = _seasonal_period_for_bucket(bucket)
+
 st.sidebar.markdown("### 🔮 Forecast settings")
-horizon = st.sidebar.number_input("Forecast horizon (periods)", min_value=1, max_value=365, value=12, step=1)
-train_ratio = st.sidebar.slider("Train/Test split", min_value=0.5, max_value=0.95, value=0.8, step=0.05)
+horizon = st.sidebar.number_input(f"Forecast horizon ({bucket.lower()} buckets)", min_value=1, max_value=365, value=12, step=1)
 
 st.sidebar.markdown("### 🧠 Algorithms")
-use_ma = st.sidebar.checkbox("Moving Average", value=True)
-ma_window = st.sidebar.selectbox("MA window", [3, 7, 12, 26], index=1, disabled=not use_ma)
 
-use_es = st.sidebar.checkbox("Exponential Smoothing", value=True, disabled=not _HAS_STATSMODELS)
-es_alpha = st.sidebar.slider("ES alpha", 0.01, 0.99, 0.3, 0.01, disabled=not (use_es and _HAS_STATSMODELS))
+use_naive = st.sidebar.checkbox("Naive", value=True)
+use_snaive = st.sidebar.checkbox("Seasonal Naive", value=True)
 
-use_hw = st.sidebar.checkbox("Holt-Winters", value=False, disabled=not _HAS_STATSMODELS)
-hw_seasonal_periods = st.sidebar.selectbox("HW seasonal periods", [4, 7, 12, 26, 52], index=2, disabled=not (use_hw and _HAS_STATSMODELS))
-hw_trend = st.sidebar.selectbox("HW trend", ["add", "mul", "None"], index=0, disabled=not (use_hw and _HAS_STATSMODELS))
-hw_seasonal = st.sidebar.selectbox("HW seasonal", ["add", "mul"], index=1, disabled=not (use_hw and _HAS_STATSMODELS))
+use_ma = st.sidebar.checkbox("Moving Average (level)", value=True)
+ma_window = st.sidebar.selectbox("MA window (buckets)", [2, 3, 4, 6, 12, 26, 52], index=3, disabled=not use_ma)
+
+use_ets = st.sidebar.checkbox("ETS (Exponential Smoothing)", value=True, disabled=not _HAS_STATSMODELS)
+ets_trend = st.sidebar.selectbox("ETS trend", ["add", "mul", "None"], index=0, disabled=not (use_ets and _HAS_STATSMODELS))
+ets_seasonal = st.sidebar.selectbox("ETS seasonal", ["add", "mul"], index=0, disabled=not (use_ets and _HAS_STATSMODELS))
 
 use_prophet = st.sidebar.checkbox("Prophet", value=False, disabled=not _HAS_PROPHET)
 prophet_mode = st.sidebar.selectbox("Prophet seasonality mode", ["multiplicative", "additive"], index=0, disabled=not (use_prophet and _HAS_PROPHET))
@@ -419,10 +558,10 @@ xgb_depth = st.sidebar.slider("XGB max_depth", 2, 12, 5, 1, disabled=not (use_xg
 xgb_lr = st.sidebar.slider("XGB learning_rate", 0.01, 0.3, 0.05, 0.01, disabled=not (use_xgb and _HAS_XGB))
 
 st.sidebar.markdown("---")
-st.sidebar.markdown("""
+st.sidebar.markdown(f"""
 <div style='color: #A0AEC0; font-size: 12px; padding: 0.5rem 0 0.5rem 0;'>
-    <strong style='color: #E2E8F0;'>Demand Forecast App</strong><br>
-    Single-file Streamlit app for easy deployment
+    <strong style='color: #E2E8F0;'>Bucket:</strong> {bucket} ({rule})<br>
+    <strong style='color: #E2E8F0;'>Seasonal period:</strong> {seasonal_periods}
 </div>
 """, unsafe_allow_html=True)
 
@@ -435,40 +574,60 @@ if df_raw is None:
     st.stop()
 
 try:
-    y = validate_and_prepare(df_raw, date_col=date_col, y_col=y_col)
+    y = validate_and_prepare(df_raw, date_col=date_col, y_col=y_col, bucket=bucket)
 except Exception as e:
     st.error(f"Data validation failed: {e}")
     st.stop()
 
-st.markdown("## 🧾 Data preview")
-st.dataframe(pd.DataFrame({"demand": y}).head(24), use_container_width=True)
+st.markdown("## 🧾 Data preview (after bucketing)")
+st.dataframe(pd.DataFrame({"demand": y}).tail(24), use_container_width=True)
 
 # Capability pills
-caps = []
-caps.append(f"Freq: {_infer_freq(y.index)}")
-caps.append(f"Rows: {len(y):,}")
+caps = [
+    f"Bucket: {bucket}",
+    f"Rule: {rule}",
+    f"Rows: {len(y):,}",
+]
+if not _HAS_STATSMODELS:
+    caps.append("statsmodels: not installed")
 if not _HAS_PROPHET:
     caps.append("Prophet: not installed")
 if not _HAS_XGB:
     caps.append("XGBoost: not installed")
-if not _HAS_STATSMODELS:
-    caps.append("statsmodels: not installed")
 
-st.markdown("<div style='margin-top:0.2rem; margin-bottom:1.4rem;'>" + "".join([f"<span class='info-pill'>{c}</span>" for c in caps]) + "</div>", unsafe_allow_html=True)
+st.markdown(
+    "<div style='margin-top:0.2rem; margin-bottom:1.4rem;'>"
+    + "".join([f"<span class='info-pill'>{c}</span>" for c in caps])
+    + "</div>",
+    unsafe_allow_html=True
+)
 
 if run_btn:
     cfg = dict(
-        use_ma=use_ma, ma_window=int(ma_window),
-        use_es=bool(use_es) and _HAS_STATSMODELS, es_alpha=float(es_alpha),
-        use_hw=bool(use_hw) and _HAS_STATSMODELS, hw_seasonal_periods=int(hw_seasonal_periods),
-        hw_trend=(None if hw_trend == "None" else hw_trend),
-        hw_seasonal=str(hw_seasonal),
-        use_prophet=bool(use_prophet) and _HAS_PROPHET, prophet_mode=str(prophet_mode),
-        use_xgb=bool(use_xgb) and _HAS_XGB, xgb_estimators=int(xgb_estimators), xgb_depth=int(xgb_depth), xgb_lr=float(xgb_lr),
+        bucket=bucket,
+        rule=rule,
+        seasonal_periods=int(seasonal_periods),
+
+        use_naive=bool(use_naive),
+        use_snaive=bool(use_snaive),
+        use_ma=bool(use_ma),
+        ma_window=int(ma_window),
+
+        use_ets=bool(use_ets) and _HAS_STATSMODELS,
+        ets_trend=(None if ets_trend == "None" else ets_trend),
+        ets_seasonal=str(ets_seasonal),
+
+        use_prophet=bool(use_prophet) and _HAS_PROPHET,
+        prophet_mode=str(prophet_mode),
+
+        use_xgb=bool(use_xgb) and _HAS_XGB,
+        xgb_estimators=int(xgb_estimators),
+        xgb_depth=int(xgb_depth),
+        xgb_lr=float(xgb_lr),
     )
 
     with st.spinner("Training models and generating forecasts..."):
-        y_train, y_test, forecasts, metrics_df, errors = run_all(y, int(horizon), float(train_ratio), cfg)
+        y_train, y_test, forecasts, metrics_df, errors = run_models(y, int(horizon), cfg)
 
     st.markdown("## 📌 Key metrics")
     c1, c2, c3, c4 = st.columns(4)
@@ -477,7 +636,7 @@ if run_btn:
     with c2:
         st.metric("Test rows", f"{len(y_test):,}")
     with c3:
-        st.metric("Horizon", f"{int(horizon)}")
+        st.metric("Horizon", f"{int(horizon)} {bucket.lower()}")
     with c4:
         st.metric("Models run", f"{len(forecasts):,}")
 
@@ -489,7 +648,7 @@ if run_btn:
     st.markdown("## 📊 Forecast comparison")
     st.plotly_chart(make_chart(y_train, y_test, forecasts), use_container_width=True, config={"displayModeBar": False})
 
-    st.markdown("## ✅ Accuracy metrics")
+    st.markdown("## ✅ Accuracy metrics (on holdout window)")
     st.dataframe(metrics_df, use_container_width=True, hide_index=True)
 
     st.markdown("## 💾 Export")
@@ -499,23 +658,26 @@ if run_btn:
 
     csv = export_df.to_csv(index=True).encode("utf-8")
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    st.download_button("📥 Download Forecasts CSV", data=csv, file_name=f"forecasts_{ts}.csv", mime="text/csv")
+    st.download_button("📥 Download Forecasts CSV", data=csv, file_name=f"forecasts_{bucket.lower()}_{ts}.csv", mime="text/csv")
 
     with st.expander("🔧 Technical details"):
-        st.markdown("""
+        st.markdown(f"""
         **What this app does**
-        - Validates + cleans a demand time series (date + demand column)
-        - Splits into train/test
+        - Parses and validates a demand time series (date + demand column)
+        - Resamples to a selected bucket (**{bucket}**) using SUM aggregation
+        - Splits into train/test using the last **{horizon}** buckets as holdout
         - Runs selected models and compares forecasts
-        - Calculates MAPE / RMSE / MAE / Bias
-        - Lets you download a CSV of the forecast window
+        - Calculates MAPE / RMSE / MAE / Bias on the holdout window
+        - Exports a CSV for the forecast window
+
+        **Seasonality defaults**
+        - Day → 7
+        - Week → 52
+        - Month → 12
 
         **Dependencies**
         - Always: streamlit, pandas, numpy, plotly
-        - Optional: statsmodels (ES + Holt-Winters), xgboost (XGBoost), prophet (Prophet)
-
-        If an optional library is not available in your deployment environment,
-        the corresponding checkbox is disabled automatically.
+        - Optional: statsmodels (ETS), xgboost (XGBoost), prophet (Prophet)
         """)
 else:
     st.info("Adjust settings in the sidebar and click **Run Forecasts**.")
